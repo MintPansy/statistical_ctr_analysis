@@ -1,0 +1,5 @@
+# 전체 데이터 (다운로드 후 data/에 저장, Git 제외)
+data/train.parquet
+data/test.parquet
+
+# data/train_sample.parquet 은 샘플이라 저장소에 포함 가능
