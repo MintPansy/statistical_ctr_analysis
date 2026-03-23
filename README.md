@@ -42,8 +42,17 @@ CTR(클릭률) 데이터에 대한 통계적 분석 및 예측 모델링 프로�
 │   ├── train.parquet          # 전체 학습 (다운로드 필요)
 │   └── test.parquet           # 테스트 (다운로드 필요)
 ├── notebooks/
-│   └── static_laboratory2.ipynb   # CTR 분석·모델링·제출 파이프라인
+│   ├── static_laboratory2.ipynb   # CTR 분석·모델링·제출 파이프라인
+│   └── ctr_pattern_db.ipynb       # DB/Parquet 기반 CTR 패턴 분석
+├── src/
+│   ├── db_connector.py        # PostgreSQL / MongoDB 연결
+│   ├── data_loader.py         # 통합 데이터 로더 (DB + Parquet)
+│   └── ctr_analysis.py        # CTR 패턴 분석 (pandas)
+├── scripts/
+│   └── upload_parquet_to_db.py    # Parquet → DB 적재
+├── app_streamlit.py           # Streamlit 대시보드
 ├── download_data.py           # 데이터 다운로드 스크립트
+├── .env.example               # DB 연결 설정 예시
 └── README.md
 ```
 
@@ -65,15 +74,61 @@ python download_data.py --sample-only
 
 ## 환경 설정
 
+### 기본 (노트북 분석)
 ```bash
 pip install pandas numpy pyarrow matplotlib seaborn scikit-learn
 ```
+
+### DB + Streamlit (전체 파이프라인)
+```bash
+pip install -r requirements_streamlit.txt
+```
+
+## 데이터 소스: Parquet / PostgreSQL / MongoDB
+
+광고 클릭 로그를 Parquet, PostgreSQL, MongoDB 중에서 선택해 로드할 수 있습니다.
+
+| 소스 | 설명 |
+|------|------|
+| **Parquet** | `data/train_sample.parquet` (기본, DB 불필요) |
+| **PostgreSQL** | `ad_click_logs` 테이블 (`POSTGRES_URI` 환경변수) |
+| **MongoDB** | `ctr_analysis.ad_click_logs` 컬렉션 (`MONGODB_URI` 환경변수) |
+
+### Parquet → DB 적재
+```bash
+# .env에 POSTGRES_URI 또는 MONGODB_URI 설정 후
+python scripts/upload_parquet_to_db.py postgres
+python scripts/upload_parquet_to_db.py mongodb
+```
+
+### Python에서 사용
+```python
+from src.data_loader import load_click_logs
+
+# Parquet (기본)
+df = load_click_logs(source="parquet", path="data/train_sample.parquet", n_rows=100_000)
+
+# PostgreSQL
+df = load_click_logs(source="postgres", n_rows=100_000)
+
+# MongoDB
+df = load_click_logs(source="mongodb", n_rows=100_000)
+```
+
+## Streamlit 대시보드
+
+```bash
+streamlit run app_streamlit.py
+```
+
+데이터 소스(Parquet/PostgreSQL/MongoDB)를 사이드바에서 선택하고, 차원별 CTR 패턴을 확인할 수 있습니다.
 
 ## 노트북 실행
 
 ### 로컬 / Jupyter
 ```bash
 jupyter notebook notebooks/static_laboratory2.ipynb
+jupyter notebook notebooks/ctr_pattern_db.ipynb   # DB/Parquet CTR 패턴
 ```
 
 ### Google Colab
