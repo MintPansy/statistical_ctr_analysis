@@ -10,7 +10,7 @@
 statistical_ctr_analysis/
 ├── notebooks/
 │   ├── static_laboratory2.ipynb        ← 논문 메인 분석 노트북
-│   ├── CTR_토스_논문_최종.ipynb         ← 논문 최종본 (합성 데이터 포함)
+│   ├── CTR_toss_thesis_final.ipynb         ← 논문 최종본 (합성 데이터 포함)
 │   └── ctr_pattern_db.ipynb            ← DB 연동 패턴 분석
 ├── scripts/
 │   ├── generate_submission.py          ← 대회 제출 파일 생성 (핵심)
