@@ -1,0 +1,8 @@
+﻿RQ,분석 대상,검정 방법,통계량,p-value,유의성
+RQ1,연령대별 CTR 차이,One-way ANOVA,F=36.72,0.000000,***
+RQ1,연령대별 CTR 차이,Kruskal-Wallis,H=182.92,0.000000,***
+RQ2,시간대별 CTR 패턴,One-way ANOVA (24h),F=17.90,0.000000,***
+RQ2,시간 구간별 CTR,One-way ANOVA (4구간),F=109.40,0.000000,***
+RQ3,지면별 CTR 차이,One-way ANOVA,F=0.84,0.780163,n.s.
+RQ3,지면 × 클릭,Chi-Square,χ²=41,0.779999,n.s.
+RQ3,요일별 CTR 차이,One-way ANOVA,F=1.20,0.302752,n.s.

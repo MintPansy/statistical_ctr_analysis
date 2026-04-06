@@ -3,3 +3,10 @@ data/train.parquet
 data/test.parquet
 .env
 # data/train_sample.parquet 은 샘플이라 저장소에 포함 가능
+
+# 대용량 생성 파일 (재생성 가능)
+notebooks/submission.csv
+notebooks/train_sample_2000000.csv
+
+# Claude Code 로컬 설정 (개인 환경 전용)
+.claude/
