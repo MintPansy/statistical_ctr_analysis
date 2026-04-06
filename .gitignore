@@ -7,6 +7,6 @@ data/test.parquet
 # 대용량 생성 파일 (재생성 가능)
 notebooks/submission.csv
 notebooks/train_sample_2000000.csv
-
+notebooks/CTR_토스_논문_최종.ipynb
 # Claude Code 로컬 설정 (개인 환경 전용)
 .claude/
