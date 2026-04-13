@@ -2,6 +2,8 @@
 data/train.parquet
 data/test.parquet
 data/train_sample.parquet
+data/*.parquet
+*.zip
 .env
 
 # 대용량 생성 파일 (재생성 가능)
