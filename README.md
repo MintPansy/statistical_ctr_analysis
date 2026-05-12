@@ -100,7 +100,9 @@
 │   ├── test.parquet               # 테스트 데이터
 │   └── sample_submission.csv      # 제출 포맷
 ├── notebooks/
-│   ├── CTR_통합_최종.ipynb         # 메인 분석 노트북 (EDA → 통계 → 모델 → SHAP)
+│   ├── CTR_논문제출용.ipynb        # 논문 제출용 실행 노트북 (권장)
+│   ├── CTR_통합_최종.ipynb         # 통합 분석 원본 노트북
+│   ├── CTR_최종점검.ipynb          # 규모 일반화 검증 노트북
 │   ├── paper_xgb_performance_table.csv  # 모델 성능표 (논문용)
 │   ├── paper_xgb_shap_top10.csv         # SHAP 상위 10개 피처 (논문용)
 │   └── paper_xgb_summary.txt            # 본문 서술 자동 생성 텍스트
@@ -117,7 +119,7 @@
 └── README.md
 ```
 
-**메인 노트북 흐름 (`CTR_통합_최종.ipynb`)**
+**제출용 노트북 흐름 (`CTR_논문제출용.ipynb`)**
 
 ```
 1. 데이터 로드 및 기본 통계
@@ -129,6 +131,10 @@
 7. SHAP 해석 — 상위 설명 변수 및 방향성 도출
 8. 논문용 결과물 자동 저장 (표·그림·서술문)
 ```
+
+보조 노트북 역할:
+- `CTR_통합_최종.ipynb`: 통합 분석 원본/개발 히스토리
+- `CTR_최종점검.ipynb`: 200k vs 500k 통제 비교 검증
 
 ---
 

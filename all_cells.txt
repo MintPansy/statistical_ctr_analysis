@@ -1,0 +1,815 @@
+# ================================================================
+# 토스 광고 CTR 분석 — 중복 제거 통합 버전
+# 연구 문제:
+#   RQ1. 연령대(age_group)별 CTR 차이가 유의미한가?
+#   RQ2. 시간대(hour)별 클릭 패턴은 어떻게 달라지는가?
+#   RQ3. 광고 노출 환경(inventory_id, day_of_week)이 CTR에 미치는 영향?
+#   RQ4. 사용자 + 노출 환경 결합 시 CTR 예측이 향상되는가?
+# ================================================================
+
+
+# ============================================================
+# [0] 라이브러리 임포트 및 공통 설정
+# ============================================================
+
+import os, platform, warnings, time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+import seaborn as sns
+from pathlib import Path
+warnings.filterwarnings('ignore')
+
+# 한글 폰트 설정
+_avail_fonts = [f.name for f in fm.fontManager.ttflist]
+_font_priority = {
+    'Windows': ['Malgun Gothic', 'NanumGothic'],
+    'Darwin':  ['AppleGothic', 'Apple SD Gothic Neo', 'NanumGothic'],
+    'Linux':   ['NanumGothic', 'UnDotum', 'DejaVu Sans'],
+}
+_system = platform.system()
+for _f in _font_priority.get(_system, ['DejaVu Sans']):
+    if _f in _avail_fonts:
+        plt.rcParams['font.family'] = _f
+        break
+plt.rcParams['axes.unicode_minus'] = False
+plt.style.use('seaborn-v0_8-whitegrid')
+sns.set_palette("husl")
+
+# GPU / CPU
+import torch
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'디바이스: {device}')
+
+
+# ============================================================
+# [1] 경로 설정 및 데이터 로드 (전체 공유)
+# ============================================================
+
+RANDOM_STATE = 42
+SAMPLE_SIZE  = 200_000
+BATCH_SIZE   = 100_000
+
+# 경로 탐색
+for _root in (Path.cwd(), Path.cwd().parent):
+    if (_root / 'data').exists():
+        BASE_DIR = _root
+        break
+else:
+    BASE_DIR = Path.cwd()
+
+TRAIN_SAMPLE_PATH = BASE_DIR / 'data' / 'train_sample.parquet'
+TRAIN_PATH        = BASE_DIR / 'data' / 'train.parquet'
+TEST_PATH         = BASE_DIR / 'data' / 'test.parquet'
+
+# ── train_sample 생성 (없을 때만) ──
+if not TRAIN_SAMPLE_PATH.exists():
+    import pyarrow.parquet as pq
+    if not TRAIN_PATH.exists():
+        raise FileNotFoundError(f'train.parquet 없음: {TRAIN_PATH}')
+    print(f'[생성] train_sample → {TRAIN_SAMPLE_PATH}')
+    rng  = np.random.default_rng(RANDOM_STATE)
+    pf   = pq.ParquetFile(str(TRAIN_PATH))
+    reservoir, total_rows = None, 0
+    for batch in pf.iter_batches(batch_size=BATCH_SIZE):
+        chunk = batch.to_pandas()
+        total_rows += len(chunk)
+        chunk['_rand_key'] = rng.random(len(chunk))
+        reservoir = chunk if reservoir is None else pd.concat([reservoir, chunk], ignore_index=True)
+        if len(reservoir) > SAMPLE_SIZE * 3:
+            reservoir = reservoir.nlargest(SAMPLE_SIZE, '_rand_key')
+    n = min(SAMPLE_SIZE, len(reservoir))
+    train_sample = (reservoir.nlargest(n, '_rand_key')
+                              .drop(columns=['_rand_key'])
+                              .sample(frac=1.0, random_state=RANDOM_STATE)
+                              .reset_index(drop=True))
+    TRAIN_SAMPLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    train_sample.to_parquet(TRAIN_SAMPLE_PATH, index=False)
+    print(f'[완료] {n:,}행 저장 (전체 {total_rows:,}행 중)')
+
+# ── 로드 ──
+train = pd.read_parquet(TRAIN_SAMPLE_PATH)
+train['clicked'] = train['clicked'].astype(int)
+
+# ── sample_submission ──
+_sample_path = next(
+    (p for p in [BASE_DIR / 'data' / 'sample_submission.csv',
+                 Path('static_document_dataset/sample_submission.csv')]
+     if p.exists()), None
+)
+sample = pd.read_csv(_sample_path) if _sample_path else None
+
+# ── test (배치 로드) ──
+def load_parquet_batches(path: Path, batch_size: int = 100_000) -> pd.DataFrame:
+    import pyarrow.parquet as pq
+    return pd.concat(
+        [b.to_pandas() for b in pq.ParquetFile(str(path)).iter_batches(batch_size=batch_size)],
+        ignore_index=True
+    )
+
+test = load_parquet_batches(TEST_PATH) if TEST_PATH.exists() else None
+
+print(f'train shape : {train.shape}')
+print(f'CTR         : {train["clicked"].mean():.4f}')
+print(f'columns     : {list(train.columns[:10])} ...')
+
+
+# ============================================================
+# [2] 파생 변수 생성 (1회만 실행)
+# ============================================================
+
+df = train.copy()
+
+# 타입 보정
+df['hour']        = pd.to_numeric(df['hour'],        errors='coerce').fillna(-1).astype(int)
+df['day_of_week'] = pd.to_numeric(df['day_of_week'], errors='coerce').fillna(-1).astype(int)
+
+# 시퀀스
+df['seq_length']      = df['seq'].astype(str).str.split(',').str.len()
+df['unique_items']    = df['seq'].astype(str).apply(lambda s: len(set(s.split(','))))
+df['diversity_ratio'] = (df['unique_items'] / df['seq_length'].replace(0, np.nan)).fillna(0)
+df['repeat_ratio']    = 1 - df['diversity_ratio']
+
+# 시간 파생
+df['hour_period'] = pd.cut(
+    df['hour'], bins=[-1, 5, 11, 17, 23],
+    labels=['심야(0-5)', '오전(6-11)', '오후(12-17)', '저녁(18-23)']
+)
+df['is_weekend']   = df['day_of_week'].isin([5, 6, 7]).astype(int)
+df['is_peak_hour'] = df['hour'].between(12, 18).astype(int)
+
+# 사용자 교호작용
+df['age_gender_interaction'] = df['age_group'].astype(str) + '_' + df['gender'].astype(str)
+
+# history 집계
+for prefix in ('history_a', 'history_b'):
+    cols = [c for c in df.columns if c.startswith(prefix + '_')]
+    if cols:
+        df[f'{prefix}_sum']  = df[cols].fillna(0).sum(axis=1)
+        df[f'{prefix}_mean'] = df[cols].fillna(0).mean(axis=1)
+        df[f'{prefix}_max']  = df[cols].fillna(0).max(axis=1)
+
+df['history_ab_ratio'] = (
+    df.get('history_a_sum', 0) + 1e-6
+) / (df.get('history_b_sum', 0) + 1e-6)
+
+# 인벤토리 CTR 인코딩
+df['inv_ctr_encoded'] = df['inventory_id'].map(
+    df.groupby('inventory_id')['clicked'].mean()
+)
+
+GLOBAL_CTR = df['clicked'].mean()
+
+print(f'\n데이터: {len(df):,}샘플 / {df["clicked"].sum():,}클릭')
+print(f'전체 CTR: {GLOBAL_CTR:.4f} ({GLOBAL_CTR*100:.2f}%)')
+print(f'클래스 불균형: {(1-GLOBAL_CTR)/GLOBAL_CTR:.1f}:1')
+print('파생 변수 생성 완료')
+
+
+# ============================================================
+# [3] 타깃 변수 분포 분석
+# ============================================================
+
+click_counts = df['clicked'].value_counts().sort_index()
+click_rate   = df['clicked'].mean()
+
+print(f'\n전체 클릭률: {click_rate:.4f} ({click_rate*100:.2f}%)')
+print(f'총 클릭 수 : {df["clicked"].sum():,} / {len(df):,}')
+print(f'불균형 비율: {(1-click_rate)/click_rate:.1f}:1 (비클릭:클릭)')
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+bars = axes[0].bar(['Non-Click', 'Click'], click_counts.values,
+                   color=['#3498db', '#e74c3c'], edgecolor='black')
+axes[0].set_title('Click Distribution (Count)', fontweight='bold')
+axes[0].set_ylabel('Sample Count')
+for bar, val in zip(bars, click_counts.values):
+    axes[0].text(bar.get_x() + bar.get_width()/2,
+                 bar.get_height() + max(click_counts)*0.01,
+                 f'{val:,}', ha='center', va='bottom')
+
+axes[1].pie(click_counts.values, labels=['Non-Click', 'Click'],
+            colors=['#3498db', '#e74c3c'], autopct='%1.2f%%', startangle=90)
+axes[1].set_title('Click Distribution (Ratio)', fontweight='bold')
+
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# [4] RQ1 — 연령대별 CTR 분석 (통계 검정 + 시각화)
+# ============================================================
+
+from scipy.stats import f_oneway, kruskal, chi2_contingency
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+
+print('\n' + '='*65)
+print('RQ1. 연령대별 클릭률 분석')
+print('='*65)
+
+age_groups  = sorted(df['age_group'].dropna().unique())
+age_samples = [df[df['age_group'] == ag]['clicked'].values for ag in age_groups]
+
+# 기술통계
+age_desc = df.groupby('age_group')['clicked'].agg(
+    Sample_Count='count', Click_Count='sum', Click_Rate='mean', Std_Dev='std'
+).round(4)
+age_desc['CI_95_Lower'] = age_desc['Click_Rate'] - 1.96*(age_desc['Std_Dev']/np.sqrt(age_desc['Sample_Count']))
+age_desc['CI_95_Upper'] = age_desc['Click_Rate'] + 1.96*(age_desc['Std_Dev']/np.sqrt(age_desc['Sample_Count']))
+print(age_desc.round(4).to_string())
+
+# 검정
+F_age,  p_anova_age   = f_oneway(*age_samples)
+H_age,  p_kruskal_age = kruskal(*age_samples)
+ss_total = ((df['clicked'] - GLOBAL_CTR)**2).sum()
+eta_sq_age = sum(len(s)*(s.mean()-GLOBAL_CTR)**2 for s in age_samples) / ss_total
+
+print(f'\n[ANOVA]          F={F_age:.4f}, p={p_anova_age:.6f} {"***" if p_anova_age<0.001 else ""}')
+print(f'[Kruskal-Wallis] H={H_age:.4f}, p={p_kruskal_age:.6f} {"***" if p_kruskal_age<0.001 else ""}')
+print(f'[Effect size]    eta2={eta_sq_age:.6f} '
+      f'({"large" if eta_sq_age>=0.14 else "medium" if eta_sq_age>=0.06 else "small"})')
+
+_mask = df['age_group'].notna()
+tukey_age = pairwise_tukeyhsd(
+    endog=df.loc[_mask, 'clicked'], groups=df.loc[_mask, 'age_group'], alpha=0.05
+)
+print('\n[Tukey HSD]')
+print(tukey_age.summary())
+
+# 성별: Chi2 + Cramer's V
+ct_gender = pd.crosstab(df['gender'], df['clicked'])
+chi2_g, p_chi2_g, _, _ = chi2_contingency(ct_gender)
+cramers_v = np.sqrt(chi2_g / (ct_gender.values.sum() * (min(ct_gender.shape)-1)))
+print(f'\n[Gender Chi2] chi2={chi2_g:.4f}, p={p_chi2_g:.6f}, Cramer\'s V={cramers_v:.4f}')
+
+# 시각화
+n = len(age_groups)
+age_index = {str(v): i for i, v in enumerate(age_groups)}
+sig_mat = np.zeros((n, n))
+for row in tukey_age.summary().data[1:]:
+    g1, g2, *_, reject_raw = row
+    reject = str(reject_raw).strip().lower() == 'true' if isinstance(reject_raw, str) else bool(reject_raw)
+    i, j = age_index.get(str(g1)), age_index.get(str(g2))
+    if i is not None and j is not None:
+        sig_mat[i, j] = sig_mat[j, i] = int(reject)
+
+ctrs   = age_desc['Click_Rate'].values
+ci_lo  = age_desc['CI_95_Lower'].values
+ci_hi  = age_desc['CI_95_Upper'].values
+x_pos  = range(n)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+axes[0].bar(x_pos, ctrs, color='steelblue', alpha=0.75, zorder=2)
+axes[0].errorbar(x_pos, ctrs, yerr=[ctrs-ci_lo, ci_hi-ctrs],
+                 fmt='none', color='black', capsize=5, zorder=3)
+axes[0].axhline(GLOBAL_CTR, color='red', linestyle='--', linewidth=1.2,
+                label=f'Overall CTR {GLOBAL_CTR:.4f}')
+axes[0].set_xticks(x_pos)
+axes[0].set_xticklabels([f'Age {ag}' for ag in age_groups])
+axes[0].set_title(f'CTR by Age Group (±95% CI)\nANOVA: F={F_age:.2f}, p={p_anova_age:.4f}, eta2={eta_sq_age:.4f}',
+                  fontweight='bold')
+axes[0].set_ylabel('Click Rate')
+axes[0].legend()
+
+im = axes[1].imshow(sig_mat, cmap='RdYlGn', vmin=0, vmax=1, aspect='auto')
+axes[1].set_xticks(range(n)); axes[1].set_yticks(range(n))
+axes[1].set_xticklabels([f'Age {ag}' for ag in age_groups], rotation=45, ha='right')
+axes[1].set_yticklabels([f'Age {ag}' for ag in age_groups])
+for i in range(n):
+    for j in range(n):
+        axes[1].text(j, i, '✓' if sig_mat[i, j] else '✗',
+                     ha='center', va='center',
+                     color='white' if sig_mat[i, j] else 'black', fontsize=12)
+axes[1].set_title('Tukey HSD Significance Matrix', fontweight='bold')
+plt.colorbar(im, ax=axes[1])
+
+plt.tight_layout()
+plt.savefig('RQ1_age_ctr.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+
+# ============================================================
+# [5] RQ2 — 시간대별 클릭 패턴 분석 (통계 검정 + 시각화)
+# ============================================================
+
+print('\n' + '='*65)
+print('RQ2. 시간대별 클릭 패턴 분석')
+print('='*65)
+
+hour_desc = df.groupby('hour')['clicked'].agg(
+    Sample_Count='count', Click_Rate='mean', Std_Dev='std'
+).round(4)
+hour_desc['CI_95'] = 1.96 * (hour_desc['Std_Dev'] / np.sqrt(hour_desc['Sample_Count']))
+
+period_desc = df.groupby('hour_period', observed=True)['clicked'].agg(
+    Sample_Count='count', Click_Rate='mean'
+).round(4)
+print('[Time Period CTR]')
+print(period_desc.to_string())
+
+# ANOVA: 24시간
+hour_samples   = [df[df['hour'] == h]['clicked'].values for h in range(24)]
+F_hour, p_hour = f_oneway(*hour_samples)
+eta_sq_hour    = sum(len(s)*(s.mean()-GLOBAL_CTR)**2 for s in hour_samples) / ss_total
+
+# ANOVA: 4구간
+period_labels  = ['심야(0-5)', '오전(6-11)', '오후(12-17)', '저녁(18-23)']
+period_samples = [df[df['hour_period'] == p]['clicked'].values for p in period_labels]
+F_period, p_period = f_oneway(*[s for s in period_samples if len(s) > 0])
+
+period_data = df[['hour_period', 'clicked']].dropna()
+tukey_period = pairwise_tukeyhsd(
+    endog=period_data['clicked'], groups=period_data['hour_period'], alpha=0.05
+)
+
+# 요일 ANOVA
+dow_vals = sorted(df['day_of_week'].dropna().unique())
+dow_samples = [df[df['day_of_week'] == d]['clicked'].values for d in dow_vals]
+F_dow, p_dow = f_oneway(*dow_samples)
+eta_sq_dow   = sum(len(s)*(s.mean()-GLOBAL_CTR)**2 for s in dow_samples) / ss_total
+
+print(f'\n[ANOVA 24h]  F={F_hour:.2f}, p={p_hour:.6f} {"***" if p_hour<0.001 else ""}')
+print(f'[ANOVA 4구간] F={F_period:.2f}, p={p_period:.6f} {"***" if p_period<0.001 else ""}')
+print(f'[ANOVA 요일]  F={F_dow:.2f},  p={p_dow:.6f} {"***" if p_dow<0.001 else ""}')
+print(f'[eta2 시간]   {eta_sq_hour:.6f}  [eta2 요일] {eta_sq_dow:.6f}')
+print('\n[Tukey HSD - 시간 구간]')
+print(tukey_period.summary())
+
+# 시각화
+h_ctrs = hour_desc['Click_Rate'].values
+h_ci   = hour_desc['CI_95'].values
+hours  = list(range(24))
+day_names = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+
+axes[0, 0].plot(hours, h_ctrs, 'b-o', linewidth=2, markersize=5, zorder=3)
+axes[0, 0].fill_between(hours, h_ctrs-h_ci, h_ctrs+h_ci, alpha=0.15, color='blue')
+axes[0, 0].axhline(GLOBAL_CTR, color='red', linestyle='--', linewidth=1.2,
+                   label=f'Overall CTR {GLOBAL_CTR:.4f}')
+axes[0, 0].axvspan(12, 18, alpha=0.08, color='orange', label='Peak(12-18)')
+axes[0, 0].set_title(f'CTR by Hour (±95% CI)\nANOVA: F={F_hour:.2f}, p={p_hour:.4f}, eta2={eta_sq_hour:.4f}',
+                     fontweight='bold')
+axes[0, 0].set_xlabel('Hour (0-23)'); axes[0, 0].set_ylabel('CTR')
+axes[0, 0].legend(); axes[0, 0].set_xticks(hours)
+
+period_ctr_vals = period_desc['Click_Rate'].reindex(period_labels)
+colors_p = ['#1a237e','#42a5f5','#ff8f00','#e53935'][:len(period_ctr_vals.dropna())]
+bars = axes[0, 1].bar(period_ctr_vals.dropna().index, period_ctr_vals.dropna().values,
+                      color=colors_p, alpha=0.85)
+axes[0, 1].axhline(GLOBAL_CTR, color='black', linestyle='--', linewidth=1.2)
+for bar, v in zip(bars, period_ctr_vals.dropna().values):
+    axes[0, 1].text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.0003,
+                    f'{v:.4f}', ha='center', fontsize=10, fontweight='bold')
+axes[0, 1].set_title(f'CTR by Time Period\nANOVA: F={F_period:.2f}, p={p_period:.4f}',
+                     fontweight='bold')
+axes[0, 1].set_ylabel('CTR'); axes[0, 1].tick_params(axis='x', rotation=10)
+
+pivot_hd = df.groupby(['day_of_week', 'hour'])['clicked'].mean().unstack()
+im = axes[1, 0].imshow(pivot_hd.values, cmap='YlOrRd', aspect='auto')
+axes[1, 0].set_yticks(range(len(pivot_hd.index)))
+axes[1, 0].set_yticklabels([day_names[i] if i < 7 else f'D{i}' for i in pivot_hd.index])
+axes[1, 0].set_xlabel('Hour (0-23)')
+axes[1, 0].set_title('Hour × Day-of-Week Heatmap', fontweight='bold')
+plt.colorbar(im, ax=axes[1, 0], label='CTR')
+
+for ag in age_groups:
+    sub = df[df['age_group'] == ag].groupby('hour')['clicked'].mean()
+    axes[1, 1].plot(sub.index, sub.values, linewidth=1.5, alpha=0.8, label=f'Age {ag}')
+axes[1, 1].axhline(GLOBAL_CTR, color='black', linestyle='--', linewidth=1, alpha=0.5)
+axes[1, 1].set_title('Hour Click Pattern by Age Group\n(RQ1+RQ2 Cross)', fontweight='bold')
+axes[1, 1].set_xlabel('Hour (0-23)'); axes[1, 1].set_ylabel('CTR')
+axes[1, 1].legend(fontsize=8, loc='upper right')
+
+plt.tight_layout()
+plt.savefig('RQ2_temporal.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+
+# ============================================================
+# [6] RQ3 — 광고 노출 환경 분석
+# ============================================================
+
+print('\n' + '='*65)
+print('RQ3. 광고 노출 환경 분석')
+print('='*65)
+
+inv_desc = df.groupby('inventory_id')['clicked'].agg(
+    Sample_Count='count', Click_Rate='mean'
+).sort_values('Click_Rate', ascending=False)
+
+print(f'총 광고 지면: {len(inv_desc)}')
+print(f'최고 CTR 지면: {inv_desc.index[0]}  ({inv_desc["Click_Rate"].iloc[0]:.4f})')
+print(f'최저 CTR 지면: {inv_desc.index[-1]}  ({inv_desc["Click_Rate"].iloc[-1]:.4f})')
+
+inv_groups = [df[df['inventory_id'] == inv]['clicked'].values for inv in df['inventory_id'].unique()]
+F_inv, p_inv = f_oneway(*inv_groups)
+chi2_inv, p_chi2_inv, _, _ = chi2_contingency(pd.crosstab(df['inventory_id'], df['clicked']))
+
+day_desc = df.groupby('day_of_week')['clicked'].agg(
+    Sample_Count='count', Click_Rate='mean', Std_Dev='std'
+).round(4)
+day_desc.index = [day_names[i] if i < 7 else f'D{i}' for i in day_desc.index]
+
+print(f'\n[ANOVA inventory] F={F_inv:.2f}, p={p_inv:.6f} {"***" if p_inv<0.001 else ""}')
+print(f'[Chi2  inventory] χ²={chi2_inv:.2f}, p={p_chi2_inv:.6f} {"***" if p_chi2_inv<0.001 else ""}')
+print(f'[ANOVA day_of_week] F={F_dow:.2f}, p={p_dow:.6f} {"***" if p_dow<0.001 else ""}')
+print('\n[요일별 CTR]')
+print(day_desc.to_string())
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+
+axes[0, 0].hist(inv_desc['Click_Rate'], bins=30, color='steelblue', alpha=0.8, edgecolor='white')
+axes[0, 0].axvline(GLOBAL_CTR, color='red', linestyle='--', linewidth=1.5,
+                   label=f'Overall Mean {GLOBAL_CTR:.4f}')
+axes[0, 0].set_title(f'Ad Placement CTR Distribution\nANOVA: F={F_inv:.2f}, p={p_inv:.4f}',
+                     fontweight='bold')
+axes[0, 0].set_xlabel('Click Rate'); axes[0, 0].set_ylabel('Number of Placements')
+axes[0, 0].legend()
+
+top15 = inv_desc.head(15); bot15 = inv_desc.tail(15)
+combined = pd.concat([top15, bot15])
+colors_inv = ['#d62728']*15 + ['#1f77b4']*15
+axes[0, 1].barh(range(len(combined)), combined['Click_Rate'],
+                color=colors_inv, alpha=0.8)
+axes[0, 1].set_yticks(range(len(combined)))
+axes[0, 1].set_yticklabels([f'Inv {i}' for i in combined.index], fontsize=7)
+axes[0, 1].axvline(GLOBAL_CTR, color='black', linestyle='--', linewidth=1.2)
+axes[0, 1].set_title('Top 15 (Red) / Bottom 15 (Blue) Placements', fontweight='bold')
+axes[0, 1].set_xlabel('Click Rate')
+
+day_ctrs = day_desc['Click_Rate'].values
+colors_d = ['#9467bd' if i >= 5 else '#1f77b4' for i in range(len(day_desc))]
+bars = axes[1, 0].bar(day_desc.index, day_ctrs, color=colors_d, alpha=0.85)
+axes[1, 0].axhline(GLOBAL_CTR, color='red', linestyle='--', linewidth=1.2,
+                   label=f'Overall Mean {GLOBAL_CTR:.4f}')
+for bar, v in zip(bars, day_ctrs):
+    axes[1, 0].text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.0002,
+                    f'{v:.4f}', ha='center', fontsize=9)
+axes[1, 0].set_title(f'Day-of-Week CTR\nANOVA: F={F_dow:.2f}, p={p_dow:.4f}',
+                     fontweight='bold')
+axes[1, 0].set_ylabel('Click Rate'); axes[1, 0].legend()
+
+top10_inv = inv_desc.head(10).index
+pivot_inv = df[df['inventory_id'].isin(top10_inv)].groupby(
+    ['inventory_id', 'hour'])['clicked'].mean().unstack(fill_value=0)
+im4 = axes[1, 1].imshow(pivot_inv.values, cmap='YlOrRd', aspect='auto')
+axes[1, 1].set_yticks(range(len(pivot_inv.index)))
+axes[1, 1].set_yticklabels([f'Inv {i}' for i in pivot_inv.index], fontsize=8)
+axes[1, 1].set_xlabel('Hour (0-23)')
+axes[1, 1].set_title('Top Placements × Hour Heatmap', fontweight='bold')
+plt.colorbar(im4, ax=axes[1, 1], label='CTR')
+
+plt.tight_layout()
+plt.savefig('RQ3_env_ctr.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+
+# ============================================================
+# [7] 피처 엔지니어링 + 전처리 (RQ4용)
+# ============================================================
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+user_feats    = ['gender', 'age_group']
+env_feats     = ['hour', 'day_of_week', 'inv_ctr_encoded', 'is_weekend', 'is_peak_hour']
+history_feats = [c for c in df.columns if c.startswith('history_') and c.endswith(('_sum','_mean','_max'))]
+history_feats += ['history_ab_ratio']
+seq_feats     = ['seq_length', 'unique_items', 'diversity_ratio', 'repeat_ratio']
+raw_numeric   = [c for c in df.columns
+                 if any(c.startswith(p) for p in ['feat_a_','feat_b_','feat_c_','feat_d_','feat_e_','l_feat_'])
+                 and df[c].dtype in [np.float64, np.int64]]
+
+ALL_FEATURES = user_feats + env_feats + history_feats + seq_feats + raw_numeric
+available_features = [c for c in dict.fromkeys(ALL_FEATURES) if c in df.columns]
+
+X = df[available_features].copy()
+
+# hour_period 정규화
+if 'hour_period' in X.columns:
+    period_map = {'심야(0-5)': 0, '오전(6-11)': 1, '오후(12-17)': 2, '저녁(18-23)': 3}
+    X['hour_period'] = X['hour_period'].map(period_map).fillna(0).astype(int)
+
+# 타입 변환
+for col in X.columns:
+    if X[col].dtype.name in ['category', 'object', 'string']:
+        X[col] = pd.to_numeric(X[col], errors='coerce')
+
+X = X.replace([np.inf, -np.inf], np.nan).fillna(X.median(numeric_only=True)).fillna(0)
+y = df['clicked'].copy()
+
+# 6:2:2 분할
+X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.4, random_state=RANDOM_STATE, stratify=y)
+X_val,   X_test, y_val,   y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=RANDOM_STATE, stratify=y_temp)
+
+print(f'\n피처 수: {len(available_features)}개')
+for name, Xs, ys in [('Train', X_train, y_train), ('Val', X_val, y_val), ('Test', X_test, y_test)]:
+    print(f'  {name:5s}: {len(Xs):>10,}  CTR={ys.mean():.4f}')
+
+# 스케일링 (LR 전용)
+scaler = StandardScaler()
+X_train_s = scaler.fit_transform(X_train)
+X_val_s   = scaler.transform(X_val)
+X_test_s  = scaler.transform(X_test)
+
+
+# ============================================================
+# [8] RQ4 — 모델 학습 및 비교 (LR / RF / XGBoost)
+# ============================================================
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import log_loss, roc_auc_score, average_precision_score
+try:
+    from xgboost import XGBClassifier
+    HAS_XGB = True
+except ImportError:
+    HAS_XGB = False
+
+print('\n' + '='*65)
+print('RQ4. CTR 예측 모델 검증')
+print('='*65)
+
+results = {}
+
+# 1. Logistic Regression
+print('\n[1/3] Logistic Regression ...')
+t0 = time.time()
+lr = LogisticRegression(C=1.0, max_iter=500, class_weight='balanced',
+                        solver='saga', random_state=RANDOM_STATE, n_jobs=-1)
+lr.fit(X_train_s, y_train)
+for split, Xs, ys in [('val', X_val_s, y_val), ('test', X_test_s, y_test)]:
+    p = lr.predict_proba(Xs)[:, 1]
+    results.setdefault('Logistic Regression', {}).update({
+        f'{split}_logloss': log_loss(ys, p),
+        f'{split}_auc':     roc_auc_score(ys, p),
+        f'{split}_ap':      average_precision_score(ys, p),
+    })
+results['Logistic Regression']['time'] = time.time() - t0
+r = results['Logistic Regression']
+print(f"  Val  LogLoss={r['val_logloss']:.4f}  AUC={r['val_auc']:.4f}  AP={r['val_ap']:.4f}")
+print(f"  Test LogLoss={r['test_logloss']:.4f}  AUC={r['test_auc']:.4f}  ({r['time']:.1f}s)")
+
+# 2. Random Forest
+print('\n[2/3] Random Forest ...')
+t0 = time.time()
+n_sub = min(len(X_train), 150_000)
+idx_rf = np.random.choice(len(X_train), n_sub, replace=False)
+rf = RandomForestClassifier(n_estimators=200, max_depth=10, min_samples_leaf=50,
+                             class_weight='balanced', random_state=RANDOM_STATE, n_jobs=-1)
+rf.fit(X_train.iloc[idx_rf], y_train.iloc[idx_rf])
+for split, Xs, ys in [('val', X_val, y_val), ('test', X_test, y_test)]:
+    p = rf.predict_proba(Xs)[:, 1]
+    results.setdefault('Random Forest', {}).update({
+        f'{split}_logloss': log_loss(ys, p),
+        f'{split}_auc':     roc_auc_score(ys, p),
+        f'{split}_ap':      average_precision_score(ys, p),
+    })
+results['Random Forest']['time'] = time.time() - t0
+r = results['Random Forest']
+print(f"  Val  LogLoss={r['val_logloss']:.4f}  AUC={r['val_auc']:.4f}  AP={r['val_ap']:.4f}")
+print(f"  Test LogLoss={r['test_logloss']:.4f}  AUC={r['test_auc']:.4f}  ({r['time']:.1f}s)")
+
+# 3. XGBoost
+if HAS_XGB:
+    print('\n[3/3] XGBoost ...')
+    t0 = time.time()
+    spw = (y_train == 0).sum() / (y_train == 1).sum()
+    xgb_model = XGBClassifier(
+        n_estimators=500, max_depth=6, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
+        scale_pos_weight=spw, eval_metric='logloss',
+        early_stopping_rounds=20, random_state=RANDOM_STATE, n_jobs=-1, verbosity=0
+    )
+    xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    for split, Xs, ys in [('val', X_val, y_val), ('test', X_test, y_test)]:
+        p = xgb_model.predict_proba(Xs)[:, 1]
+        results.setdefault('XGBoost', {}).update({
+            f'{split}_logloss': log_loss(ys, p),
+            f'{split}_auc':     roc_auc_score(ys, p),
+            f'{split}_ap':      average_precision_score(ys, p),
+        })
+    results['XGBoost']['time'] = time.time() - t0
+    r = results['XGBoost']
+    print(f"  Val  LogLoss={r['val_logloss']:.4f}  AUC={r['val_auc']:.4f}  AP={r['val_ap']:.4f}")
+    print(f"  Test LogLoss={r['test_logloss']:.4f}  AUC={r['test_auc']:.4f}  ({r['time']:.1f}s)")
+
+# 결과표
+print('\n' + '='*62)
+print(f'{"모델":<22} {"Val LogLoss":>11} {"Val AUC":>8} {"Test LogLoss":>12} {"Test AUC":>9}')
+print('-'*62)
+for name, r in results.items():
+    print(f"{name:<22} {r['val_logloss']:>11.4f} {r['val_auc']:>8.4f} "
+          f"{r['test_logloss']:>12.4f} {r['test_auc']:>9.4f}")
+print('='*62)
+
+# 성능 시각화
+models = list(results.keys())
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+x = np.arange(len(models)); w = 0.35
+
+for ax, metric, ylabel in [
+    (axes[0], 'logloss', 'LogLoss (Lower is Better)'),
+    (axes[1], 'auc',     'AUC (Higher is Better)'),
+]:
+    val_vals  = [results[m][f'val_{metric}']  for m in models]
+    test_vals = [results[m][f'test_{metric}'] for m in models]
+    ax.bar(x - w/2, val_vals,  w, label='Val',  color='#5B9BD5', alpha=0.85)
+    ax.bar(x + w/2, test_vals, w, label='Test', color='#ED7D31', alpha=0.85)
+    ax.set_title(ylabel, fontweight='bold')
+    ax.set_xticks(x); ax.set_xticklabels(models, rotation=10)
+    ax.legend(); ax.set_ylabel(metric.upper())
+    for i, (v, t) in enumerate(zip(val_vals, test_vals)):
+        ax.text(i - w/2, v + 0.001, f'{v:.4f}', ha='center', fontsize=8)
+        ax.text(i + w/2, t + 0.001, f'{t:.4f}', ha='center', fontsize=8)
+
+plt.suptitle('RQ4 Model Validation', fontsize=13)
+plt.tight_layout()
+plt.savefig('model_performance.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+
+# ============================================================
+# [9] XGBoost Ablation Study (피처 서브셋 비교)
+# ============================================================
+
+if HAS_XGB:
+    from sklearn.model_selection import StratifiedKFold
+
+    print('\n' + '='*65)
+    print('Ablation Study — Feature Subset 비교 (3-Fold CV)')
+    print('='*65)
+
+    user_cols = [c for c in X.columns if any(c.startswith(f) for f in ['gender','age_group'])]
+    env_cols  = [c for c in X.columns if any(c.startswith(f) for f in ['hour','day_of_week','inv_ctr','is_'])]
+    all_cols  = list(X.columns)
+
+    subsets = {
+        'User only':    user_cols,
+        'Env only':     env_cols,
+        'User + Env':   list(dict.fromkeys(user_cols + env_cols)),
+        'Full':         all_cols,
+    }
+
+    cv_abl   = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+    abl_rows = []
+
+    for label, cols in subsets.items():
+        valid_cols = [c for c in cols if c in X.columns]
+        if not valid_cols:
+            continue
+        X_sub = X[valid_cols]
+        ap_folds, auc_folds = [], []
+        for tr_i, va_i in cv_abl.split(X_sub, y):
+            Xtr, Xva = X_sub.iloc[tr_i], X_sub.iloc[va_i]
+            ytr, yva = y.iloc[tr_i],     y.iloc[va_i]
+            clf = XGBClassifier(
+                n_estimators=200, max_depth=5, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8,
+                scale_pos_weight=(ytr==0).sum()/(ytr==1).sum(),
+                random_state=RANDOM_STATE, n_jobs=-1, verbosity=0
+            )
+            clf.fit(Xtr.fillna(Xtr.mean()), ytr)
+            prob = clf.predict_proba(Xva.fillna(Xtr.mean()))[:, 1]
+            ap_folds.append(average_precision_score(yva, prob))
+            auc_folds.append(roc_auc_score(yva, prob))
+        abl_rows.append({
+            'Feature Set': label, 'n_features': len(valid_cols),
+            'AP': np.mean(ap_folds), 'AP_std': np.std(ap_folds),
+            'AUC': np.mean(auc_folds), 'AUC_std': np.std(auc_folds),
+        })
+        print(f'  [{label:12s}] n={len(valid_cols):4d}  AP={np.mean(ap_folds):.4f}±{np.std(ap_folds):.4f}  '
+              f'AUC={np.mean(auc_folds):.4f}±{np.std(auc_folds):.4f}')
+
+    abl_df = pd.DataFrame(abl_rows)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    colors_abl = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+    for ax, metric, std_col, ylabel in [
+        (axes[0], 'AP',  'AP_std',  'Average Precision'),
+        (axes[1], 'AUC', 'AUC_std', 'ROC AUC'),
+    ]:
+        bars = ax.bar(range(len(abl_df)), abl_df[metric],
+                      yerr=abl_df[std_col], color=colors_abl[:len(abl_df)], alpha=0.85, capsize=5)
+        ax.set_xticks(range(len(abl_df)))
+        ax.set_xticklabels(abl_df['Feature Set'], rotation=10, ha='right')
+        ax.set_ylabel(ylabel); ax.set_title(f'Ablation Study — {ylabel}', fontweight='bold')
+        for bar, v in zip(bars, abl_df[metric]):
+            ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.001,
+                    f'{v:.4f}', ha='center', fontsize=9, fontweight='bold')
+        ax.grid(True, alpha=0.3, axis='y')
+
+    plt.suptitle('Ablation Study: Feature Subset Impact on CTR (3-Fold CV) — RQ4',
+                 fontsize=12, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.savefig('ablation_study.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+
+# ============================================================
+# [10] SHAP 해석 (XGBoost 기준)
+# ============================================================
+
+if HAS_XGB:
+    try:
+        import shap
+        print('\nSHAP 분석 중...')
+        rng_shap = np.random.default_rng(RANDOM_STATE)
+        shap_idx = rng_shap.choice(len(X_val), size=min(2000, len(X_val)), replace=False)
+        X_shap   = X_val.iloc[shap_idx]
+
+        explainer  = shap.TreeExplainer(xgb_model)
+        shap_vals  = explainer.shap_values(X_shap)
+        if isinstance(shap_vals, list):
+            shap_vals = shap_vals[1]
+
+        shap_importance = (
+            pd.Series(np.abs(shap_vals).mean(axis=0), index=X_shap.columns)
+            .sort_values(ascending=False)
+        )
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        shap.summary_plot(shap_vals, X_shap, max_display=20, show=False, plot_type='dot',
+                          plot_size=None)
+        plt.sca(axes[0])
+        axes[0].set_title('SHAP Summary Plot — Top 20 Features', fontweight='bold')
+
+        shap_importance.head(15).sort_values().plot(kind='barh', ax=axes[1], color='steelblue')
+        axes[1].set_title('SHAP Feature Importance (Mean |SHAP|)', fontweight='bold')
+        axes[1].set_xlabel('mean(|SHAP value|)')
+
+        plt.tight_layout()
+        plt.savefig('shap_summary.png', dpi=150, bbox_inches='tight')
+        plt.show()
+
+        print('\nTop 10 SHAP features:')
+        print(shap_importance.head(10).to_frame('mean_abs_shap'))
+    except ImportError:
+        print('SHAP 미설치: pip install shap')
+
+
+# ============================================================
+# [11] 추론 및 제출 파일 생성
+# ============================================================
+
+if test is not None and HAS_XGB:
+    print('\n추론 시작...')
+    X_test_final = (
+        test[[c for c in available_features if c in test.columns]]
+        .apply(pd.to_numeric, errors='coerce')
+        .fillna(0)
+        .astype(np.float32)
+    )
+    # 누락 컬럼 보완
+    for c in available_features:
+        if c not in X_test_final.columns:
+            X_test_final[c] = 0
+    X_test_final = X_test_final[available_features]
+
+    test_preds = xgb_model.predict_proba(X_test_final)[:, 1]
+
+    if sample is not None:
+        submission = sample.copy()
+        submission['clicked'] = test_preds
+        out_path = BASE_DIR / 'notebooks' / 'submission_xgb.csv'
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        submission.to_csv(out_path, index=False)
+        print(f'제출 파일 저장: {out_path}')
+        print(f'예측 평균 CTR: {test_preds.mean():.6f}')
+        print(submission.head())
+    else:
+        print('sample_submission.csv 없음 — 예측값만 생성됨')
+        print(f'test_preds shape: {test_preds.shape}, mean: {test_preds.mean():.6f}')
+
+
+# ============================================================
+# [12] 논문용 최종 요약
+# ============================================================
+
+print('\n' + '='*65)
+print('연구 결론 요약')
+print('='*65)
+print(f'RQ1 — 연령대별 CTR: ANOVA F={F_age:.2f}, p={p_anova_age:.6f}, eta2={eta_sq_age:.4f}')
+print(f'      => {"유의미한 차이 존재 (p<0.001)" if p_anova_age<0.001 else "유의하지 않음"}')
+print(f'      => 효과 크기: {"작음 — 실질적 영향 제한적" if eta_sq_age<0.06 else "중간" if eta_sq_age<0.14 else "큼"}')
+
+print(f'\nRQ2 — 시간대별 CTR: ANOVA F={F_hour:.2f}, p={p_hour:.6f}, eta2={eta_sq_hour:.4f}')
+print(f'      => {"유의미한 시간 효과 존재" if p_hour<0.001 else "유의하지 않음"}')
+
+print(f'\nRQ3 — 광고 지면 CTR: ANOVA F={F_inv:.2f}, p={p_inv:.6f}')
+print(f'      => {"광고 지면 간 유의미한 CTR 차이 존재" if p_inv<0.001 else "유의하지 않음"}')
+print(f'      요일 효과: ANOVA F={F_dow:.2f}, p={p_dow:.6f} {"(유의)" if p_dow<0.001 else "(비유의)"}')
+
+if 'abl_df' in dir() and len(abl_df) >= 3:
+    u_ap = abl_df.loc[abl_df['Feature Set']=='User only',  'AP'].values[0]
+    e_ap = abl_df.loc[abl_df['Feature Set']=='Env only',   'AP'].values[0]
+    c_ap = abl_df.loc[abl_df['Feature Set']=='User + Env', 'AP'].values[0]
+    print(f'\nRQ4 — 피처 결합 효과: User AP={u_ap:.4f}, Env AP={e_ap:.4f}, Combined AP={c_ap:.4f}')
+    print(f'      => {"사용자+환경 결합이 CTR 예측 향상 확인" if c_ap>max(u_ap,e_ap) else "단일 그룹보다 개선 없음"}')
+
+print('\n본 연구의 기여:')
+print('  CTR이 왜 달라지는지를 통계적으로 설명하고 모델로 재검증하여')
+print('  실무 의사결정(타겟팅/노출 시간 최적화)으로 연결한 데 있다.')

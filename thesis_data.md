@@ -78,7 +78,8 @@
 ```
 statistical_ctr_analysis/
 ├── notebooks/
-│   ├── CTR_통합_최종.ipynb              ← 메인 분석 노트북 (EDA → 통계 → 모델 → SHAP)
+│   ├── CTR_논문제출용.ipynb             ← 논문 제출용 실행 노트북 (권장)
+│   ├── CTR_통합_최종.ipynb              ← 통합 분석 원본 노트북
 │   ├── CTR_최종점검.ipynb               ← 규모 일반화 검증 (200k vs 500k 통제 비교)
 │   ├── paper_xgb_performance_table.csv ← 모델 성능표 (논문용 산출물)
 │   ├── paper_xgb_shap_top10.csv        ← SHAP 상위 10개 피처 (논문용 산출물)
@@ -105,8 +106,8 @@ statistical_ctr_analysis/
 
 ## 노트북 파일
 
-### `notebooks/CTR_통합_최종.ipynb` — **메인 분석 노트북**
-논문 분석의 핵심 파일. EDA → 통계 검정 → 모델 → SHAP 순서로 구성.
+### `notebooks/CTR_논문제출용.ipynb` — **논문 제출용 실행 노트북 (권장)**
+논문 제출을 위해 셀 흐름을 정리한 독립 노트북. 본문 재현 실행은 이 파일 기준을 권장.
 
 | 단계 | 내용 |
 |------|------|
@@ -115,9 +116,15 @@ statistical_ctr_analysis/
 | 3 | **RQ1** — 사용자 특성(연령·성별)별 CTR + ANOVA, 카이제곱, Tukey HSD |
 | 4 | **RQ2** — 시간대별 CTR + ANOVA, eta² |
 | 5 | **RQ3** — 요일별 CTR + ANOVA, eta² |
-| 6 | **RQ4** — XGBoost 학습 및 피처 수 실험 (top 50 / 75 / 100 / 112) |
+| 6 | **RQ4** — XGBoost 학습 및 피처 수 실험 |
 | 7 | SHAP 해석 — 상위 설명 변수 및 방향성 도출 |
 | 8 | 논문용 결과물 자동 저장 (표·그림·서술문) |
+
+---
+
+### `notebooks/CTR_통합_최종.ipynb` — **통합 분석 원본 노트북**
+- 개발/탐색 과정이 포함된 통합 버전
+- 제출본 수정 시 원본 추적 및 비교 기준으로 활용
 
 ---
 
@@ -184,7 +191,8 @@ streamlit run app_streamlit.py
 
 | 노트북 | 역할 | 논문 포지션 |
 |--------|------|------------|
-| `CTR_통합_최종.ipynb` | EDA + 통계 검정 + XGBoost + SHAP | **핵심 본문** |
+| `CTR_논문제출용.ipynb` | 제출용 실행 흐름(EDA + 통계 + XGBoost + SHAP) | **핵심 본문(실행 기준)** |
+| `CTR_통합_최종.ipynb` | 통합 분석 원본/개발 히스토리 | 본문 근거 보강 |
 | `CTR_최종점검.ipynb` | 200k vs 500k 통제 비교, 재현성 점검 | 방법론 보강 / 부록 |
 
 
